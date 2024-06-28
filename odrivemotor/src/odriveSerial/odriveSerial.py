@@ -77,6 +77,8 @@ class OdriveSerial(Motor, Reconfigurable):
             self.current_lim = self.odrv.axis0.config.general_lockin.current
 
     async def set_power(self, power: float, extra: Optional[Dict[str, Any]] = None, **kwargs):
+        if abs(power) < 0.1:
+            LOGGER.error("Cannot move motor at a power percent that is nearly 0")
         torque = power * self.current_lim * self.torque_constant
         self.odrv.axis0.controller.config.input_mode = InputMode.PASSTHROUGH
         self.odrv.axis0.controller.config.control_mode = ControlMode.TORQUE_CONTROL
@@ -86,22 +88,17 @@ class OdriveSerial(Motor, Reconfigurable):
         self.odrv.axis0.controller.input_torque = torque
 
     async def go_for(self, rpm: float, revolutions: float, extra: Optional[Dict[str, Any]] = None, **kwargs):
+        if abs(rpm) < 0.1:
+            LOGGER.error("Cannot move motor at an RPM that is nearly 0")
         rps = rpm / MINUTE_TO_SECOND
-        if revolutions == 0:
-            self.odrv.axis0.controller.config.input_mode = InputMode.PASSTHROUGH
-            self.odrv.axis0.controller.config.control_mode = ControlMode.VELOCITY_CONTROL
-            self.odrv.axis0.requested_state = AxisState.CLOSED_LOOP_CONTROL
-            await self.wait_until_correct_state(AxisState.CLOSED_LOOP_CONTROL)
-            self.odrv.axis0.controller.input_vel = rps
+        await self.configure_trap_trajectory(abs(rpm))
+        current_position = await self.get_position()
+        if rpm > 0:
+            # the line below causes motion.
+            self.odrv.axis0.controller.input_pos = current_position + revolutions + self.offset
         else:
-            await self.configure_trap_trajectory(abs(rpm))
-            current_position = await self.get_position()
-            if rpm > 0:
-                # the line below causes motion.
-                self.odrv.axis0.controller.input_pos = current_position + revolutions + self.offset
-            else:
-                # the line below causes motion.
-                self.odrv.axis0.controller.input_pos = current_position - revolutions + self.offset
+            # the line below causes motion.
+            self.odrv.axis0.controller.input_pos = current_position - revolutions + self.offset
         await self.wait_and_set_to_idle(rps, revolutions)
 
     async def go_to(self, rpm: float, revolutions: float, extra: Optional[Dict[str, Any]] = None, **kwargs):
@@ -110,7 +107,14 @@ class OdriveSerial(Motor, Reconfigurable):
         await self.go_for(rpm, revolutions)
 
     async def set_rpm(self, rpm: float, extra: Optional[Dict[str, Any]] = None, **kwargs):
-        LOGGER.warn("set_rpm is unimplemented")
+        if abs(rpm) < 0.1:
+            LOGGER.error("Cannot move motor at an RPM that is nearly 0")
+        rps = rpm / MINUTE_TO_SECOND
+        self.odrv.axis0.controller.config.input_mode = InputMode.PASSTHROUGH
+        self.odrv.axis0.controller.config.control_mode = ControlMode.VELOCITY_CONTROL
+        self.odrv.axis0.requested_state = AxisState.CLOSED_LOOP_CONTROL
+        await self.wait_until_correct_state(AxisState.CLOSED_LOOP_CONTROL)
+        self.odrv.axis0.controller.input_vel = rps
 
     async def reset_zero_position(self, offset: float, extra: Optional[Dict[str, Any]] = None, **kwargs):
         position = await self.get_position()

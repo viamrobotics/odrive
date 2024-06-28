@@ -17,6 +17,7 @@ from threading import Thread
 import asyncio
 import time
 from ..utils import set_configs, find_baudrate, rsetattr, find_axis_configs
+from pathlib import Path
 
 import can
 import cantools
@@ -51,11 +52,13 @@ class OdriveCAN(Motor, Reconfigurable):
         odriveCAN.current_limit = 10
         odriveCAN.offset = 0.0
         odriveCAN.goal = {"position": 0.0, "active": False}
-        odriveCAN.db = cantools.database.load_file("odrive-cansimple.dbc")
+
+        path = str(Path().absolute()) + "/odrivemotor/odrive-cansimple.dbc"
+        odriveCAN.db = cantools.database.load_file(path)
 
         if odriveCAN.odrive_config_file != "":
             if odriveCAN.serial_number == "":
-                LOGGER.warning("If you are using multiple Odrive controllers, make sure to add their respective serial_number to each component attributes")
+                LOGGER.info("If you are using multiple Odrive controllers, make sure to add their respective serial_number to each component attributes")
             try:
                 odriveCAN.odrv = odrive.find_any() if odriveCAN.serial_number == "" else odrive.find_any(serial_number = odriveCAN.serial_number)
                 odriveCAN.odrv.clear_errors()
@@ -79,7 +82,7 @@ class OdriveCAN(Motor, Reconfigurable):
         else:
             odriveCAN.baud_rate = "250000"
         
-        LOGGER.warn("Remember to run 'sudo ip link set can0 up type can bitrate <baud_rate>' "+
+        LOGGER.info("Remember to run 'sudo ip link set can0 up type can bitrate <baud_rate>' "+
                     "in your terminal. See the README Troubleshooting section for more details.")
 
         def periodically_surface_errors(odriveCAN):
@@ -119,7 +122,7 @@ class OdriveCAN(Motor, Reconfigurable):
 
         if baud_rate != self.baud_rate:
             self.baud_rate = baud_rate
-            LOGGER.warn("Since you changed the baud rate, you must run 'sudo ip link set can0 up type can bitrate <baud_rate>' "+
+            LOGGER.info("Since you changed the baud rate, you must run 'sudo ip link set can0 up type can bitrate <baud_rate>' "+
                          "in your terminal. See the README Troubleshooting section for more details.")
         
         new_nodeID = config.attributes.fields["canbus_node_id"].number_value
@@ -127,6 +130,8 @@ class OdriveCAN(Motor, Reconfigurable):
             self.set_node_id(new_nodeID)
 
     async def set_power(self, power: float, extra: Optional[Dict[str, Any]] = None, **kwargs):
+        if abs(power) < 0.001:
+            LOGGER.error("Cannot move motor at a power percent that is nearly 0")
         torque = power*self.current_limit*self.torque_constant
         await self.send_can_message('Set_Axis_State', {'Axis_Requested_State': 0x08})
         await self.wait_until_correct_state(AxisState.CLOSED_LOOP_CONTROL)
@@ -134,31 +139,25 @@ class OdriveCAN(Motor, Reconfigurable):
         await self.send_can_message('Set_Input_Torque', {'Input_Torque': torque})
 
     async def go_for(self, rpm: float, revolutions: float, extra: Optional[Dict[str, Any]] = None, **kwargs):
+        if abs(rpm) < 0.001:
+            LOGGER.error("Cannot move motor at an RPM that is nearly 0")
         rps = rpm / MINUTE_TO_SECOND
+        await self.send_can_message('Set_Controller_Mode', {'Control_Mode': 0x03, 'Input_Mode': 0x05})
+        await self.send_can_message('Set_Traj_Vel_Limit', {'Traj_Vel_Limit': abs(rps)})
+        await self.send_can_message('Set_Axis_State', {'Axis_Requested_State': 0x08})
+        await self.wait_until_correct_state(AxisState.CLOSED_LOOP_CONTROL)
 
-        if revolutions == 0.0:
-            await self.send_can_message('Set_Controller_Mode', {'Control_Mode': 0x02, 'Input_Mode': 0x01})
-            await self.send_can_message('Set_Axis_State', {'Axis_Requested_State': 0x08})
-            await self.wait_until_correct_state(AxisState.CLOSED_LOOP_CONTROL)
-            await self.send_can_message('Set_Input_Vel', {'Input_Vel': rps, 'Input_Torque_FF': 0})
-
+        current_position = await self.get_position()
+        goal_position = 0
+        if rpm > 0.0:
+            goal_position = current_position+revolutions+self.offset
+            await self.send_can_message('Set_Input_Pos', {'Input_Pos': (goal_position), 'Vel_FF': 0, 'Torque_FF': 0})
         else:
-            await self.send_can_message('Set_Controller_Mode', {'Control_Mode': 0x03, 'Input_Mode': 0x05})
-            await self.send_can_message('Set_Traj_Vel_Limit', {'Traj_Vel_Limit': abs(rps)})
-            await self.send_can_message('Set_Axis_State', {'Axis_Requested_State': 0x08})
-            await self.wait_until_correct_state(AxisState.CLOSED_LOOP_CONTROL)
+            goal_position = current_position-revolutions+self.offset
+            await self.send_can_message('Set_Input_Pos', {'Input_Pos': (goal_position), 'Vel_FF': 0, 'Torque_FF': 0})
 
-            current_position = await self.get_position()
-            goal_position = 0
-            if rpm > 0.0:
-                goal_position = current_position+revolutions+self.offset
-                await self.send_can_message('Set_Input_Pos', {'Input_Pos': (goal_position), 'Vel_FF': 0, 'Torque_FF': 0})
-            else:
-                goal_position = current_position-revolutions+self.offset
-                await self.send_can_message('Set_Input_Pos', {'Input_Pos': (goal_position), 'Vel_FF': 0, 'Torque_FF': 0})
-
-            self.goal["position"] = goal_position
-            self.goal["active"] = True
+        self.goal["position"] = goal_position
+        self.goal["active"] = True
     
     async def go_to(self, rpm: float, revolutions: float, extra: Optional[Dict[str, Any]] = None, **kwargs):
         current_position = await self.get_position()
@@ -169,7 +168,13 @@ class OdriveCAN(Motor, Reconfigurable):
             LOGGER.info("Already at requested position")
     
     async def set_rpm(self, rpm: float, extra: Optional[Dict[str, Any]] = None, **kwargs):
-        LOGGER.warn("set_rpm is unimplemented")
+        if abs(rpm) < 0.001:
+            LOGGER.error("Cannot move motor at an RPM that is nearly 0")
+        rps = rpm / MINUTE_TO_SECOND
+        await self.send_can_message('Set_Controller_Mode', {'Control_Mode': 0x02, 'Input_Mode': 0x01})
+        await self.send_can_message('Set_Axis_State', {'Axis_Requested_State': 0x08})
+        await self.wait_until_correct_state(AxisState.CLOSED_LOOP_CONTROL)
+        await self.send_can_message('Set_Input_Vel', {'Input_Vel': rps, 'Input_Torque_FF': 0})
 
     async def reset_zero_position(self, offset: float, extra: Optional[Dict[str, Any]] = None, **kwargs):
         position = await self.get_position()
@@ -214,7 +219,7 @@ class OdriveCAN(Motor, Reconfigurable):
                     return False
     
     async def get_geometries(self) -> List[Geometry] :
-	    pass
+        pass
                 
     async def do_command(self) -> Dict[str, Any]:
         pass
@@ -262,5 +267,5 @@ class OdriveCAN(Motor, Reconfigurable):
             self.bus.send(msg)
         except can.CanError:
             LOGGER.error("Message (" + name + ") NOT sent! Please verify can0 is working first")
-            LOGGER.warn("You may need to run 'sudo ip link set can0 up type can bitrate <baud_rate>' in your terminal. " +
+            LOGGER.info("You may need to run 'sudo ip link set can0 up type can bitrate <baud_rate>' in your terminal. " +
                          "See the README Troubleshooting section for more details.")
